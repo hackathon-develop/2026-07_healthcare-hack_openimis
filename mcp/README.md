@@ -6,11 +6,20 @@ for querying an openIMIS PostgreSQL database:
 - `search_insuree(chf_id, last_name)`
 - `get_active_policies(chf_id)`
 - `get_claims_for_insuree(chf_id, start_date, end_date)`
+- `get_claim_by_code(claim_code)`
 - `list_health_facilities(district)`
+- `search_diagnosis(query)`, `search_medical_service(query)`, `search_medical_item(query)` —
+  resolve valid ICD/service/item IDs before creating a claim
 - `get_claims_trend_by_facility(period_days, end_date, min_claims, top_n)` —
   facilities with the fastest-changing claim volume (period-over-period)
 - `get_daily_claims_for_facility(hf_code, start_date, end_date)` —
   day-by-day claim counts for one facility, for drilling into a trend
+- `detect_diagnosis_anomalies(baseline_days, recent_days, min_total_claims, z_threshold, top_n)` —
+  screens for possible outbreak signals: diagnosis categories per district
+  running statistically above their historical baseline (see "Detecting
+  outbreak signals" below — **screening signal, not a diagnosis of an outbreak**)
+- `get_claim_mutation_schema()`, `create_claim(claim_input)`, `submit_claim(claim_uuid)` —
+  create claims via openIMIS's own GraphQL API (see "Creating claims" below)
 
 > Commands below are given for bash (macOS/Linux) with a PowerShell (Windows)
 > equivalent alongside wherever the syntax actually differs — line
@@ -376,6 +385,109 @@ the exact client-side config depends on which client you're using.
   provider's docs for their expected sslmode — some hosted providers
   (e.g. Supabase) require specific pooler hostnames for external connections.
 
+## Creating claims (write path)
+
+Every tool above is a read against Postgres. Claim creation is different on
+purpose: it talks to **openIMIS's own GraphQL API**, not the database
+directly. A raw SQL insert into `tblClaim` would skip openIMIS's pricing,
+ceiling, and policy-coverage validation, its claim code generation, and its
+audit trail — going through `createClaim`/`submitClaim` preserves all of that.
+
+### One-time setup: a dedicated openIMIS technical user
+
+Create a technical user (or interactive user) in openIMIS's own user/role
+admin, scoped to **only**:
+- `create_claim` (right `111002` by default)
+- `submit_claim` (right `111007` by default)
+
+Do not point this at an admin account — the same least-privilege principle
+as the read-only DB role applies here, just enforced through openIMIS's own
+rights system instead of Postgres grants.
+
+Add to `.env`:
+```
+OPENIMIS_GRAPHQL_URL=https://your-openimis-host/api/graphql
+OPENIMIS_TECH_USER=your-technical-user
+OPENIMIS_TECH_PASSWORD=your-technical-user-password
+```
+
+### The recommended flow
+
+The exact input fields `createClaim` expects differ across openIMIS
+versions and deployments — rather than guessing, `get_claim_mutation_schema`
+asks your live server directly via GraphQL introspection. Use tools in this
+order:
+
+1. **`get_claim_mutation_schema()`** — confirms the real input field names
+   for `createClaim`/`submitClaim` on *your* instance.
+2. **Resolve every ID** using `search_insuree`, `list_health_facilities`,
+   `search_diagnosis`, `search_medical_service`, `search_medical_item` —
+   never let the model guess an ID or code.
+3. **`create_claim(claim_input)`** — creates the claim in its normal
+   draft/"entered" state. This does **not** submit it.
+4. **`get_claim_by_code(claim_code)`** — confirm it actually landed (claim
+   creation via the GraphQL API can be processed asynchronously — it may
+   not appear the instant `create_claim` returns) and that it looks right.
+5. **`submit_claim(claim_uuid)`** — only once you've checked step 4. This
+   moves the claim into openIMIS's real validation/adjudication workflow,
+   so it's kept as a deliberate, separate step rather than something
+   `create_claim` does automatically.
+
+Steps 3 and 5 are intentionally separate tools so a human (or at least a
+second, explicit tool call) reviews a created claim before it's submitted —
+don't collapse them into one "just create and submit" flow.
+
+### Things you'll likely need to adjust
+
+- The `search_diagnosis` / `search_medical_service` / `search_medical_item`
+  tools use best-guess table/column names (`tblICDCodes`,
+  `tblMedicalServices`, `tblMedicalItems`) that are **not** verified against
+  a live instance — check them with `\dt` / `\d` the same way you did for
+  the other tables in Step 1, and adjust the SQL if needed.
+- The `ClaimInputType` name in `create_claim`'s mutation string is a common
+  name across openIMIS versions but not guaranteed — `get_claim_mutation_schema()`
+  will tell you the real type name if it differs.
+- `submit_claim` assumes the mutation takes a list of UUIDs
+  (`submitClaim(uuids: [...])`) — some versions key this differently;
+  again, `get_claim_mutation_schema()` is the source of truth, not this file.
+- If `_get_openimis_token()` raises an auth error despite correct
+  credentials, try switching the `Authorization` header prefix from
+  `Bearer` to `JWT` in `_openimis_graphql()` — `django-graphql-jwt`
+  (which openIMIS uses) has historically defaulted to the `JWT` prefix.
+
+## Detecting outbreak signals
+
+`detect_diagnosis_anomalies` screens for diagnosis categories (grouped by
+the first 3 characters of ICD code, e.g. all A00.x together) running
+statistically above their historical baseline in a given district — the
+same idea behind CDC's EARS C1/C2 aberration detection: a z-score against
+a historical baseline, not just a raw count comparison.
+
+**Read this before treating any result as meaningful:**
+
+- **This is a screening signal, not confirmation of an outbreak.** Claims
+  reflect coded diagnoses among people who sought and paid for care — not
+  confirmed disease incidence in the population. A high z-score can mean a
+  real outbreak, but can just as easily mean a coding change, a new
+  facility coming online, normal seasonality (e.g. malaria in rainy
+  season), or a data quality issue. Always route flagged results to a
+  human for investigation — never treat this as automated confirmation.
+- **Zero-count days matter.** The query deliberately fills in days with no
+  claims (via `generate_series`) before computing the baseline mean/stddev.
+  Skipping this — only averaging days that had at least one claim — quietly
+  inflates the baseline and can hide real spikes in rarer diagnoses. If you
+  modify this query, keep the zero-filling.
+- **The `ICDID` foreign key name on `tblClaim` is an unverified guess**,
+  same caveat as the other diagnosis/service/item tools — confirm with
+  `\d "tblClaim"` and adjust if your schema differs (some versions store
+  diagnoses in a separate claim-diagnosis table rather than directly on
+  the claim row).
+- **Performance**: the query cross-joins a date range against every
+  observed (diagnosis category, district) pair, so very long
+  `baseline_days` values on a large, diverse dataset can get slow. The
+  `min_total_claims` filter exists specifically to keep that cross-join
+  small by dropping categories too rare to bother analyzing anyway.
+
 ## Testing
 
 **Get test data.** Don't point this at a production database. Spin up
@@ -448,6 +560,15 @@ grant on that specific table, or a date format mismatch.
   outside Google Cloud (option C), set `OPENIMIS_DB_SSLMODE=require` —
   `prefer` silently allows plaintext if the server doesn't offer TLS, which
   matters a lot more once traffic is crossing the public internet.
+- **Claim creation is a write path — treat it accordingly.** `create_claim`
+  and `submit_claim` are the only tools in this server that change data.
+  Keep the technical user scoped to just those two rights, keep create and
+  submit as separate steps (see "Creating claims" above), and consider
+  requiring an explicit human confirmation before `submit_claim` is ever
+  called in whatever client drives this server — not just as a matter of
+  good practice, but because submission triggers real downstream workflow
+  (adjudication, and in some deployments an AI-based adjudication module
+  listening for exactly that event).
 - **Data protection law.** Depending on where this is deployed, health and
   insurance data may fall under regulations like GDPR, a national health
   data protection act, or similar. This project doesn't handle
