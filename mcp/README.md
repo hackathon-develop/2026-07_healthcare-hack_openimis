@@ -7,6 +7,10 @@ for querying an openIMIS PostgreSQL database:
 - `get_active_policies(chf_id)`
 - `get_claims_for_insuree(chf_id, start_date, end_date)`
 - `list_health_facilities(district)`
+- `get_claims_trend_by_facility(period_days, end_date, min_claims, top_n)` —
+  facilities with the fastest-changing claim volume (period-over-period)
+- `get_daily_claims_for_facility(hf_code, start_date, end_date)` —
+  day-by-day claim counts for one facility, for drilling into a trend
 
 > Commands below are given for bash (macOS/Linux) with a PowerShell (Windows)
 > equivalent alongside wherever the syntax actually differs — line

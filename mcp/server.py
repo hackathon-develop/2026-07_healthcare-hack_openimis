@@ -27,6 +27,7 @@ signatures and overall structure won't need to change, just the query text.
 import os
 import logging
 from contextlib import contextmanager
+from datetime import date, timedelta
 from typing import Optional
 
 import psycopg2
@@ -80,7 +81,8 @@ DB_CONFIG = {
 # internet, since "prefer" silently falls back to an unencrypted connection
 # if the server doesn't offer TLS.
 
-MAX_ROWS = 50  # hard cap on any result set returned to the model
+MAX_ROWS = 50          # hard cap for record-level results (may contain PII)
+MAX_ROWS_AGGREGATE = 180  # higher cap for pure count/aggregate results (no PII)
 
 
 @contextmanager
@@ -94,11 +96,11 @@ def get_connection():
         conn.close()
 
 
-def run_query(sql: str, params: tuple) -> list[dict]:
+def run_query(sql: str, params: tuple, max_rows: int = MAX_ROWS) -> list[dict]:
     with get_connection() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(sql, params)  # always parameterized, never f-strings
-            rows = cur.fetchmany(MAX_ROWS)
+            rows = cur.fetchmany(max_rows)
             return [dict(row) for row in rows]
 
 
@@ -188,7 +190,7 @@ def get_claims_for_insuree(chf_id: str, start_date: str, end_date: str) -> list[
                hf."HFName" AS health_facility
         FROM "tblClaim" c
         JOIN "tblInsuree" i ON i."InsureeID" = c."InsureeID"
-        JOIN "tblHF" hf ON hf."HFID" = c."HFID"
+        JOIN "tblHF" hf ON hf."HfID" = c."HFID"
         WHERE i."CHFID" = %s
           AND c."DateClaimed" BETWEEN %s AND %s
           AND c."ValidityTo" IS NULL
@@ -224,6 +226,109 @@ def list_health_facilities(district: Optional[str] = None) -> list[dict]:
             ORDER BY hf."HFName"
         '''
         return run_query(sql, ())
+
+
+@mcp.tool()
+def get_claims_trend_by_facility(
+    period_days: int = 14,
+    end_date: Optional[str] = None,
+    min_claims: int = 5,
+    top_n: int = 15,
+) -> list[dict]:
+    """
+    Find health facilities where claim volume is changing fastest, by
+    comparing two adjacent time windows: the most recent `period_days` days
+    vs. the `period_days` days immediately before that. Returns facilities
+    sorted by absolute increase in claim count (largest increase first) —
+    use this to answer questions like "where are claims increasing fast?".
+
+    Returns only facility identifiers and counts, no patient-level data.
+
+    Args:
+        period_days: Length of each comparison window, in days. Default 14
+            (a two-week-over-two-week comparison). Use a larger value (e.g.
+            30) for a slower-moving, less noisy signal.
+        end_date: ISO date (YYYY-MM-DD) marking the end of the "recent"
+            window, exclusive. Defaults to today.
+        min_claims: Minimum combined claim count (recent + previous) for a
+            facility to be included. Filters out noise from very low-volume
+            facilities, where a jump from 1 to 3 claims looks like a 200%
+            increase but isn't meaningful.
+        top_n: Max number of facilities to return (capped at 50).
+    """
+    top_n = min(max(top_n, 1), 50)
+    end = date.fromisoformat(end_date) if end_date else date.today()
+    recent_start = end - timedelta(days=period_days)
+    prev_start = end - timedelta(days=2 * period_days)
+
+    log_call(
+        "get_claims_trend_by_facility",
+        period_days=period_days, end_date=str(end), min_claims=min_claims, top_n=top_n,
+    )
+
+    sql = '''
+        WITH recent AS (
+            SELECT c."HFID" AS hf_id, COUNT(*) AS cnt
+            FROM "tblClaim" c
+            WHERE c."DateClaimed" >= %s AND c."DateClaimed" < %s
+              AND c."ValidityTo" IS NULL
+            GROUP BY c."HFID"
+        ),
+        previous AS (
+            SELECT c."HFID" AS hf_id, COUNT(*) AS cnt
+            FROM "tblClaim" c
+            WHERE c."DateClaimed" >= %s AND c."DateClaimed" < %s
+              AND c."ValidityTo" IS NULL
+            GROUP BY c."HFID"
+        )
+        SELECT hf."HFCode" AS code, hf."HFName" AS name,
+               COALESCE(r.cnt, 0) AS claims_recent,
+               COALESCE(p.cnt, 0) AS claims_previous,
+               COALESCE(r.cnt, 0) - COALESCE(p.cnt, 0) AS absolute_change,
+               CASE WHEN COALESCE(p.cnt, 0) = 0 THEN NULL
+                    ELSE ROUND((COALESCE(r.cnt, 0) - COALESCE(p.cnt, 0))::numeric / p.cnt * 100, 1)
+               END AS pct_change
+        FROM "tblHF" hf
+        LEFT JOIN recent r ON r.hf_id = hf."HfID"
+        LEFT JOIN previous p ON p.hf_id = hf."HfID"
+        WHERE hf."ValidityTo" IS NULL
+          AND (COALESCE(r.cnt, 0) + COALESCE(p.cnt, 0)) >= %s
+        ORDER BY absolute_change DESC
+        LIMIT %s
+    '''
+    params = (recent_start, end, prev_start, recent_start, min_claims, top_n)
+    return run_query(sql, params, max_rows=top_n)
+
+
+@mcp.tool()
+def get_daily_claims_for_facility(hf_code: str, start_date: str, end_date: str) -> list[dict]:
+    """
+    Get a day-by-day claim count for a single health facility. Use this to
+    drill into a trend flagged by get_claims_trend_by_facility and see its
+    actual shape over time (steady climb vs. a single spike day, etc).
+
+    Returns only dates and counts, no patient-level data.
+
+    Args:
+        hf_code: Health facility code (from list_health_facilities or
+            get_claims_trend_by_facility).
+        start_date: ISO date (YYYY-MM-DD), inclusive.
+        end_date: ISO date (YYYY-MM-DD), inclusive. Keep the range to
+            roughly 6 months or less — results are capped at 180 rows (one
+            per day) and will silently truncate beyond that.
+    """
+    log_call("get_daily_claims_for_facility", hf_code=hf_code, start_date=start_date, end_date=end_date)
+    sql = '''
+        SELECT c."DateClaimed"::date AS claim_date, COUNT(*) AS claim_count
+        FROM "tblClaim" c
+        JOIN "tblHF" hf ON hf."HfID" = c."HFID"
+        WHERE hf."HFCode" = %s
+          AND c."DateClaimed" BETWEEN %s AND %s
+          AND c."ValidityTo" IS NULL
+        GROUP BY c."DateClaimed"::date
+        ORDER BY claim_date
+    '''
+    return run_query(sql, (hf_code, start_date, end_date), max_rows=MAX_ROWS_AGGREGATE)
 
 
 if __name__ == "__main__":
