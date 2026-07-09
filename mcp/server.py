@@ -159,11 +159,13 @@ def get_active_policies(chf_id: str) -> list[dict]:
                pr."ProductName" AS product_name, p."EffectiveDate" AS effective_date,
                p."ExpiryDate" AS expiry_date, p."PolicyStatus" AS status
         FROM "tblPolicy" p
-        JOIN "tblInsuree" i ON i."InsureeID" = p."InsureeID"
+        JOIN "tblInsureePolicy" ip ON ip."PolicyId" = p."PolicyID"
+        JOIN "tblInsuree" i ON i."InsureeID" = ip."InsureeID"
         JOIN "tblProduct" pr ON pr."ProdID" = p."ProdID"
         WHERE i."CHFID" = %s
           AND p."ValidityTo" IS NULL
-          AND p."ExpiryDate" >= CURRENT_DATE
+          -- AND p."ExpiryDate" >= CURRENT_DATE
+          AND p."PolicyStatus" = 2
         ORDER BY p."ExpiryDate" DESC
     '''
     return run_query(sql, (chf_id,))
