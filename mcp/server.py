@@ -19,7 +19,7 @@ in Postgres): "tblInsuree", "tblPolicy", "tblClaim", "tblHF", "tblFamilies".
 
 If you're on the newer modular/Django backend, table names instead look like
 insuree_insuree, policy_policy, claim_claim, location_healthfacility (all
-lowercase, Django app_label + model name). Run `\dt` in psql against your DB
+lowercase, Django app_label + model name). Run `\\dt` in psql against your DB
 and adjust the SQL strings in the functions below accordingly — the tool
 signatures and overall structure won't need to change, just the query text.
 """
@@ -31,14 +31,21 @@ from typing import Optional
 
 import psycopg2
 import psycopg2.extras
+from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+
+load_dotenv()  # loads .env into os.environ if present; no-op if the file is missing
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openimis-mcp")
 
+PORT = int(os.environ.get("PORT", 8080))
+
 mcp = FastMCP(
     "openimis-mcp",
     stateless_http=True,  # required for correctness once Cloud Run scales beyond 1 instance
+    host="0.0.0.0",
+    port=PORT,
 )
 
 
@@ -57,6 +64,7 @@ DB_CONFIG = {
     "dbname": os.environ.get("OPENIMIS_DB_NAME", "openimis"),
     "user": os.environ.get("OPENIMIS_DB_USER", "openimis_readonly"),
     "password": os.environ.get("OPENIMIS_DB_PASSWORD"),
+    "sslmode": os.environ.get("OPENIMIS_DB_SSLMODE", "prefer"),
 }
 # If your Postgres is Cloud SQL and you're connecting via the Cloud SQL Unix
 # socket (recommended over a public IP), set OPENIMIS_DB_HOST to
@@ -64,6 +72,13 @@ DB_CONFIG = {
 # treats a host value starting with "/" as a socket directory automatically,
 # so no other code changes are needed. See the deploy command below for the
 # matching --add-cloudsql-instances flag.
+#
+# If your database is OUTSIDE Google Cloud entirely (on-prem, another cloud,
+# a hosted Postgres provider) and reachable only over the public internet,
+# set OPENIMIS_DB_SSLMODE=require (or verify-full, if you also configure a
+# root cert) — never leave it at "prefer" for traffic crossing the public
+# internet, since "prefer" silently falls back to an unencrypted connection
+# if the server doesn't offer TLS.
 
 MAX_ROWS = 50  # hard cap on any result set returned to the model
 
@@ -210,6 +225,6 @@ def list_health_facilities(district: Optional[str] = None) -> list[dict]:
 
 
 if __name__ == "__main__":
-    # Streamable HTTP transport, suitable for Cloud Run deployment.
-    port = int(os.environ.get("PORT", 8080))
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
+    # host/port are configured on the FastMCP constructor above, not here —
+    # passing them to run() directly raises TypeError on current SDK versions.
+    mcp.run(transport="streamable-http")
