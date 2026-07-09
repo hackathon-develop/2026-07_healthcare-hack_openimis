@@ -50,10 +50,12 @@ whole schema. If a future tool needs another table, add it explicitly.
 ## 3. Run locally
 
 ```bash
-uv sync
+python3 -m venv .venv
+source .venv/bin/activate      # on Windows: .venv\Scripts\activate
+pip install -r requirements.txt
 cp .env.example .env   # fill in real values
 set -a; source .env; set +a
-uv run server.py
+python server.py
 ```
 
 This starts the MCP server on streamable HTTP at `http://localhost:8080`.
@@ -165,7 +167,7 @@ Then point `test_server.py` at it — change `SERVER_URL` in that file to
 `http://localhost:3000/mcp`, or set it via an env var if you prefer — and run:
 
 ```bash
-uv run test_server.py --chf-id <a real CHF ID>
+python test_server.py --chf-id <a real CHF ID>
 ```
 
 For a real MCP client (Claude, Gemini CLI, etc.) instead of the local proxy,
@@ -214,15 +216,15 @@ docker compose exec db psql -U postgres -d openimis -c 'SELECT "CHFID", "LastNam
 tools by hand without needing an LLM client wired up:
 
 ```bash
-npx @modelcontextprotocol/inspector uv run server.py
+npx @modelcontextprotocol/inspector python server.py
 ```
 
 **Or run the scripted smoke test** included here (`test_server.py`), which
 connects as a real MCP client and calls each tool in sequence:
 
 ```bash
-uv run test_server.py                    # lists a few insurees first
-uv run test_server.py --chf-id <a real CHF ID from above>
+python test_server.py                    # lists a few insurees first
+python test_server.py --chf-id <a real CHF ID from above>
 ```
 
 If a tool call errors out, it's almost always one of: wrong table/column
