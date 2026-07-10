@@ -1,0 +1,6 @@
+google-genai
+streamlit
+mcp
+httpx
+python-dotenv
+asyncio
