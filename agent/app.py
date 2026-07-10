@@ -39,33 +39,41 @@ STEP 4: REPORT GENERATION
   [If >=3 records: State that the file meets the completeness criteria. If <3 records: Detail the policy/guidelines retrieved from openISMS regarding how to handle the missing records.]
 
 Always maintain a professional, clinical tone. Do not invent medical data or ISMS policies—rely strictly on the data returned by your tools.
-"""
+# ----------------- Debug Logging -----------------
+import os
+show_debug = os.getenv("SHOW_DEBUG_LOG", "true").lower() in ("true", "1", "yes")
 
-# Initialize persistent session states
+if "debug_logs" not in st.session_state:
+    st.session_state.debug_logs = []
+
+def log_debug(message):
+    st.session_state.debug_logs.append(message)
+
+# ----------------- Initialization -----------------
 if "mcp_manager" not in st.session_state:
+    log_debug("Initializing MCP Manager...")
     manager = MultiMcpManager()
-    # Connect synchronously using the background thread
     manager.connect()
     st.session_state.mcp_manager = manager
+    log_debug("MCP Manager connected.")
 
-# Show connection warnings if any server fails to connect
 status = st.session_state.mcp_manager.connection_status
 for server, info in status.items():
     if not info["connected"]:
         st.warning(f"⚠️ Could not connect to {server.upper()} MCP server: {info['error']}")
 
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
 try:
     if "gemini_client" not in st.session_state:
+        log_debug("Initializing Gemini Client...")
         st.session_state.gemini_client = genai.Client()
 
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
-
     if "gemini_chat_session" not in st.session_state:
-        # Gather dynamic tools from active MCP endpoints
         mcp_tools = st.session_state.mcp_manager.get_all_tools()
+        log_debug(f"Gathered {len(mcp_tools)} tools from MCP endpoints.")
         
-        # Initialize the Gemini Chat session
         st.session_state.gemini_chat_session = st.session_state.gemini_client.chats.create(
             model="gemini-2.5-flash",
             config=types.GenerateContentConfig(
@@ -74,54 +82,84 @@ try:
                 temperature=0.1
             )
         )
+        log_debug("Gemini Chat Session created.")
 except Exception as e:
-    st.error(f"❌ Failed to initialize Gemini Client: {e}")
-    st.stop()
+    err_msg = f"Failed to initialize Gemini Client. Error: {e}"
+    st.error(f"❌ {err_msg}")
+    log_debug(f"ERROR: {err_msg}")
 
-# Display historical messages in the chat UI
-for message in st.session_state.chat_history:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+# ----------------- UI Layout -----------------
+if show_debug:
+    main_col, debug_col = st.columns([3, 1])
+else:
+    main_col = st.container()
+    debug_col = None
 
-# Main interface handling loop
-if user_input := st.chat_input("Enter your message here..."):
-    # Render user message
-    with st.chat_message("user"):
-        st.markdown(user_input)
-    st.session_state.chat_history.append({"role": "user", "content": user_input})
+with main_col:
+    # Display historical messages in the chat UI
+    for message in st.session_state.chat_history:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-    # Render agent stream response box
-    with st.chat_message("assistant"):
-        response_placeholder = st.empty()
-        full_response = ""
-        
-        # Dispatch message to Gemini chat session
-        response = st.session_state.gemini_chat_session.send_message(user_input)
-        
-        # Tool execution loop (Function Calling Orchestration)
-        while response.function_calls:
-            function_responses = []
-            for function_call in response.function_calls:
-                tool_name = function_call.name
-                tool_args = function_call.args
-                
-                with st.spinner(f"Querying system tool: {tool_name}..."):
-                    # Execute tool call synchronously from the manager
-                    tool_output = st.session_state.mcp_manager.call_tool(tool_name, tool_args)
-                
-                # Append the structural execution output data
-                function_responses.append(
-                    types.Part.from_function_response(
-                        name=tool_name,
-                        response={"result": tool_output}
-                    )
-                )
+    # Main interface handling loop
+    if user_input := st.chat_input("Enter your message here..."):
+        log_debug(f"User input: {user_input}")
+        with st.chat_message("user"):
+            st.markdown(user_input)
+        st.session_state.chat_history.append({"role": "user", "content": user_input})
+
+        with st.chat_message("assistant"):
+            response_placeholder = st.empty()
+            full_response = ""
             
-            # Send all tool responses back to Gemini
-            response = st.session_state.gemini_chat_session.send_message(function_responses)
-        
-        # Capture final textual response text from the model loop
-        full_response = response.text
-        response_placeholder.markdown(full_response)
-        
-    st.session_state.chat_history.append({"role": "assistant", "content": full_response})
+            if "gemini_chat_session" not in st.session_state:
+                st.error("Cannot process message: Gemini Client failed to initialize. Please check API Key and server connections.")
+                st.stop()
+                
+            log_debug("Sending message to Gemini...")
+            response = st.session_state.gemini_chat_session.send_message(user_input)
+            
+            # Tool execution loop (Function Calling Orchestration)
+            while response.function_calls:
+                function_responses = []
+                for function_call in response.function_calls:
+                    tool_name = function_call.name
+                    tool_args = function_call.args
+                    
+                    log_debug(f"Executing tool: {tool_name}")
+                    with st.spinner(f"Querying system tool: {tool_name}..."):
+                        tool_output = st.session_state.mcp_manager.call_tool(tool_name, tool_args)
+                    log_debug(f"Tool {tool_name} returned {len(str(tool_output))} chars")
+                    
+                    function_responses.append(
+                        types.Part.from_function_response(
+                            name=tool_name,
+                            response={"result": tool_output}
+                        )
+                    )
+                
+                log_debug("Sending tool responses back to Gemini...")
+                response = st.session_state.gemini_chat_session.send_message(function_responses)
+            
+            full_response = response.text
+            response_placeholder.markdown(full_response)
+            log_debug("Received final text response from Gemini.")
+            
+        st.session_state.chat_history.append({"role": "assistant", "content": full_response})
+
+if debug_col:
+    with debug_col:
+        st.subheader("🛠️ Debug Logs")
+        try:
+            debug_container = st.container(height=600)
+            with debug_container:
+                for log_msg in st.session_state.debug_logs:
+                    st.text(log_msg)
+        except TypeError:
+            # Fallback for older Streamlit versions that don't support height in st.container
+            for log_msg in st.session_state.debug_logs:
+                st.text(log_msg)
+                
+        if st.button("Clear Logs"):
+            st.session_state.debug_logs = []
+            st.rerun()
