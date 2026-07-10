@@ -39,6 +39,8 @@ STEP 4: REPORT GENERATION
   [If >=3 records: State that the file meets the completeness criteria. If <3 records: Detail the policy/guidelines retrieved from openISMS regarding how to handle the missing records.]
 
 Always maintain a professional, clinical tone. Do not invent medical data or ISMS policies—rely strictly on the data returned by your tools.
+"""
+
 # ----------------- Debug Logging -----------------
 import os
 show_debug = os.getenv("SHOW_DEBUG_LOG", "true").lower() in ("true", "1", "yes")
