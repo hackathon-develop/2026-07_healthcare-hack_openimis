@@ -17,39 +17,33 @@ STEP 1: IDENTIFICATION
 - When the user starts the chat, greet them professionally and ask for their Patient ID. 
 - Do not proceed to Step 2 until the user provides an ID.
 
-STEP 2: EMR RETRIEVAL
-- Once the user provides an ID, use the EMR tool to query their records.
-- Analyze the retrieved data specifically looking for "recent treatment records" (defined as records dated within the last 12 months from today).
+STEP 2: ISMS RETRIEVAL
+- Once the user provides an ID, do NOT query the EMR. Go directly to querying the openISMS tool.
+- Query the organizational policy regarding "incomplete patient history," "missing recent records," or "alternative data gathering protocols".
 
-STEP 3: COMPLIANCE EVALUATION & ISMS RETRIEVAL
-- Count the recent treatment records.
-- IF you find 3 or more recent records: The EMR data is sufficient. Move directly to Step 4.
-- IF you find FEWER than 3 recent records (0, 1, or 2): The patient file lacks sufficient recent history. You must immediately call the openISMS tool to query the organizational policy regarding "incomplete patient history," "missing recent records," or "alternative data gathering protocols."
-
-STEP 4: REPORT GENERATION
+STEP 3: REPORT GENERATION
 - Compile all findings into a structured, easy-to-read Markdown report. 
 - The report MUST include the following sections:
-  ## Patient Summary
-  [Brief summary of the patient based on EMR data]
-  
-  ## Record Status
-  [State exactly how many recent treatment records were found in the last 12 months]
+  ## Patient ID
+  [The Patient ID provided by the user]
   
   ## Compliance & Next Steps
-  [If >=3 records: State that the file meets the completeness criteria. If <3 records: Detail the policy/guidelines retrieved from openISMS regarding how to handle the missing records.]
+  [Detail the policy/guidelines retrieved from openISMS regarding how to handle patient records and alternative data gathering protocols.]
 
 Always maintain a professional, clinical tone. Do not invent medical data or ISMS policies—rely strictly on the data returned by your tools.
 """
 
 # ----------------- Debug Logging -----------------
 import os
+import datetime
 show_debug = os.getenv("SHOW_DEBUG_LOG", "true").lower() in ("true", "1", "yes")
 
 if "debug_logs" not in st.session_state:
     st.session_state.debug_logs = []
 
 def log_debug(message):
-    st.session_state.debug_logs.append(message)
+    timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    st.session_state.debug_logs.append(f"[{timestamp}] {message}")
 
 # ----------------- Initialization -----------------
 if "mcp_manager" not in st.session_state:
@@ -103,12 +97,14 @@ with main_col:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    # Main interface handling loop
-    if user_input := st.chat_input("Enter your message here..."):
-        log_debug(f"User input: {user_input}")
+# Main interface handling loop MUST be at root level to avoid StreamlitAPIException
+if user_input := st.chat_input("Enter your message here..."):
+    log_debug(f"User input: {user_input}")
+    st.session_state.chat_history.append({"role": "user", "content": user_input})
+
+    with main_col:
         with st.chat_message("user"):
             st.markdown(user_input)
-        st.session_state.chat_history.append({"role": "user", "content": user_input})
 
         with st.chat_message("assistant"):
             response_placeholder = st.empty()
@@ -128,10 +124,11 @@ with main_col:
                     tool_name = function_call.name
                     tool_args = function_call.args
                     
-                    log_debug(f"Executing tool: {tool_name}")
+                    log_debug(f"Executing tool: {tool_name} | Args: {tool_args}")
                     with st.spinner(f"Querying system tool: {tool_name}..."):
                         tool_output = st.session_state.mcp_manager.call_tool(tool_name, tool_args)
-                    log_debug(f"Tool {tool_name} returned {len(str(tool_output))} chars")
+                    out_str = str(tool_output)
+                    log_debug(f"Tool {tool_name} completed. Output length: {len(out_str)} chars. Prefix: {out_str[:80]}...")
                     
                     function_responses.append(
                         types.Part.from_function_response(
