@@ -45,46 +45,10 @@ def log_debug(message):
     timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
     st.session_state.debug_logs.append(f"[{timestamp}] {message}")
 
-# ----------------- Initialization -----------------
-if "mcp_manager" not in st.session_state:
-    log_debug("Initializing MCP Manager...")
-    manager = MultiMcpManager()
-    manager.connect()
-    st.session_state.mcp_manager = manager
-    log_debug("MCP Manager connected.")
-
-status = st.session_state.mcp_manager.connection_status
-for server, info in status.items():
-    if not info["connected"]:
-        st.warning(f"⚠️ Could not connect to {server.upper()} MCP server: {info['error']}")
-
+# ----------------- UI Layout -----------------
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-try:
-    if "gemini_client" not in st.session_state:
-        log_debug("Initializing Gemini Client...")
-        st.session_state.gemini_client = genai.Client()
-
-    if "gemini_chat_session" not in st.session_state:
-        mcp_tools = st.session_state.mcp_manager.get_all_tools()
-        log_debug(f"Gathered {len(mcp_tools)} tools from MCP endpoints.")
-        
-        st.session_state.gemini_chat_session = st.session_state.gemini_client.chats.create(
-            model="gemini-2.5-flash",
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                tools=mcp_tools if mcp_tools else None,
-                temperature=0.1
-            )
-        )
-        log_debug("Gemini Chat Session created.")
-except Exception as e:
-    err_msg = f"Failed to initialize Gemini Client. Error: {e}"
-    st.error(f"❌ {err_msg}")
-    log_debug(f"ERROR: {err_msg}")
-
-# ----------------- UI Layout -----------------
 if show_debug:
     main_col, debug_col = st.columns([3, 1])
 else:
@@ -110,10 +74,48 @@ if user_input := st.chat_input("Enter your message here..."):
             response_placeholder = st.empty()
             full_response = ""
             
+            # --- Lazy Initialization ---
+            with st.spinner("Connecting to servers... (First use only)"):
+                if "mcp_manager" not in st.session_state:
+                    log_debug("Initializing MCP Manager...")
+                    manager = MultiMcpManager()
+                    manager.connect()
+                    st.session_state.mcp_manager = manager
+                    log_debug("MCP Manager connected.")
+                    
+                    status = st.session_state.mcp_manager.connection_status
+                    for server, info in status.items():
+                        if not info["connected"]:
+                            st.warning(f"⚠️ Could not connect to {server.upper()} MCP server: {info['error']}")
+
+                try:
+                    if "gemini_client" not in st.session_state:
+                        log_debug("Initializing Gemini Client...")
+                        st.session_state.gemini_client = genai.Client()
+
+                    if "gemini_chat_session" not in st.session_state:
+                        mcp_tools = st.session_state.mcp_manager.get_all_tools()
+                        log_debug(f"Gathered {len(mcp_tools)} tools from MCP endpoints.")
+                        
+                        st.session_state.gemini_chat_session = st.session_state.gemini_client.chats.create(
+                            model="gemini-2.5-flash",
+                            config=types.GenerateContentConfig(
+                                system_instruction=SYSTEM_INSTRUCTION,
+                                tools=mcp_tools if mcp_tools else None,
+                                temperature=0.1
+                            )
+                        )
+                        log_debug("Gemini Chat Session created.")
+                except Exception as e:
+                    err_msg = f"Failed to initialize Gemini Client. Error: {e}"
+                    st.error(f"❌ {err_msg}")
+                    log_debug(f"ERROR: {err_msg}")
+            
             if "gemini_chat_session" not in st.session_state:
                 st.error("Cannot process message: Gemini Client failed to initialize. Please check API Key and server connections.")
                 st.stop()
-                
+            # --------------------------
+            
             log_debug("Sending message to Gemini...")
             response = st.session_state.gemini_chat_session.send_message(user_input)
             
