@@ -1,5 +1,4 @@
 import streamlit as st
-import asyncio
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
@@ -45,9 +44,15 @@ Always maintain a professional, clinical tone. Do not invent medical data or ISM
 # Initialize persistent session states
 if "mcp_manager" not in st.session_state:
     manager = MultiMcpManager()
-    # Run async connection loop within sync streamlit script
-    asyncio.run(manager.connect_servers())
+    # Connect synchronously using the background thread
+    manager.connect()
     st.session_state.mcp_manager = manager
+
+# Show connection warnings if any server fails to connect
+status = st.session_state.mcp_manager.connection_status
+for server, info in status.items():
+    if not info["connected"]:
+        st.warning(f"⚠️ Could not connect to {server.upper()} MCP server: {info['error']}")
 
 if "gemini_client" not in st.session_state:
     st.session_state.gemini_client = genai.Client()
@@ -57,7 +62,7 @@ if "chat_history" not in st.session_state:
 
 if "gemini_chat_session" not in st.session_state:
     # Gather dynamic tools from active MCP endpoints
-    mcp_tools = asyncio.run(st.session_state.mcp_manager.get_all_tools())
+    mcp_tools = st.session_state.mcp_manager.get_all_tools()
     
     # Initialize the Gemini Chat session
     st.session_state.gemini_chat_session = st.session_state.gemini_client.chats.create(
@@ -91,23 +96,25 @@ if user_input := st.chat_input("Enter your message here..."):
         
         # Tool execution loop (Function Calling Orchestration)
         while response.function_calls:
+            function_responses = []
             for function_call in response.function_calls:
                 tool_name = function_call.name
                 tool_args = function_call.args
                 
                 with st.spinner(f"Querying system tool: {tool_name}..."):
-                    # Execute tool call synchronously from the async manager
-                    tool_output = asyncio.run(
-                        st.session_state.mcp_manager.call_tool(tool_name, tool_args)
-                    )
+                    # Execute tool call synchronously from the manager
+                    tool_output = st.session_state.mcp_manager.call_tool(tool_name, tool_args)
                 
-                # Send the structural execution output data back to Gemini
-                response = st.session_state.gemini_chat_session.send_message(
+                # Append the structural execution output data
+                function_responses.append(
                     types.Part.from_function_response(
                         name=tool_name,
                         response={"result": tool_output}
                     )
                 )
+            
+            # Send all tool responses back to Gemini
+            response = st.session_state.gemini_chat_session.send_message(function_responses)
         
         # Capture final textual response text from the model loop
         full_response = response.text
