@@ -30,10 +30,11 @@ TABLE NAMES:
 openIMIS schema differs by version. This file is written for the LEGACY
 schema (MSSQL-derived, mixed-case table/column names requiring double quotes
 in Postgres): "tblInsuree", "tblPolicy", "tblClaim", "tblHF", "tblFamilies".
-The diagnosis/medical service/medical item table and column names below are
+The diagnosis/medical service/medical item table and column names (including
+"tblICDCodes", "tblServices", "tblItems", "tblClaimItems") are
 a BEST GUESS based on common legacy openIMIS naming conventions and are NOT
 verified against a live instance — check them with `\\dt`/`\\d` against your
-own database before relying on those three tools.
+own database before relying on the tools that use them.
 
 If you're on the newer modular/Django backend, table names instead look like
 insuree_insuree, policy_policy, claim_claim, location_healthfacility (all
@@ -47,6 +48,7 @@ import logging
 from contextlib import contextmanager
 from datetime import date, timedelta
 from typing import Optional
+from urllib.parse import urlsplit
 
 import psycopg2
 import psycopg2.extras
@@ -148,6 +150,41 @@ def log_call(tool_name: str, **kwargs):
     logger.info("tool_call=%s args=%s", tool_name, kwargs)
 
 
+# Shared across calls so the CSRF cookie fetched by _get_csrf_token() is
+# still attached when _openimis_graphql() sends the matching X-CSRFToken
+# header — a fresh session per call would never have the cookie.
+_http_session = requests.Session()
+
+
+def _get_csrf_token() -> Optional[str]:
+    """
+    Prime _http_session with a Django CSRF cookie. Mutations on this
+    instance are CSRF-protected even though they're JWT-authenticated, so
+    without this, createClaim/submitClaim fail with "CSRF token missing or
+    incorrect."
+
+    The GraphQL endpoint itself is POST-only here (a GET returns 415, so it
+    doesn't render GraphiQL/set a cookie) — instead, hit the Django admin
+    login page on the same origin, whose template always renders
+    {% csrf_token %} and triggers the Set-Cookie.
+
+    Returns None (rather than raising) if no cookie shows up — some
+    deployments may not need this, and callers fall back to sending no
+    X-CSRFToken header in that case.
+    """
+    parsed = urlsplit(OPENIMIS_GRAPHQL_URL)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    for path in ("/admin/login/", "/"):
+        try:
+            _http_session.get(origin + path, timeout=15)
+        except requests.RequestException:
+            continue
+        token = _http_session.cookies.get("csrftoken")
+        if token:
+            return token
+    return None
+
+
 def _get_openimis_token() -> str:
     """
     Authenticate against openIMIS's own GraphQL API and return a JWT.
@@ -168,9 +205,12 @@ def _get_openimis_token() -> str:
             }
         }
     '''
-    resp = requests.post(
+    csrf_token = _get_csrf_token()
+    headers = {"X-CSRFToken": csrf_token, "Referer": OPENIMIS_GRAPHQL_URL} if csrf_token else {}
+    resp = _http_session.post(
         OPENIMIS_GRAPHQL_URL,
         json={"query": mutation, "variables": {"username": OPENIMIS_TECH_USER, "password": OPENIMIS_TECH_PASSWORD}},
+        headers=headers,
         timeout=15,
     )
     resp.raise_for_status()
@@ -183,16 +223,31 @@ def _get_openimis_token() -> str:
 def _openimis_graphql(query: str, variables: dict) -> dict:
     """Run an authenticated GraphQL request against openIMIS's own API."""
     token = _get_openimis_token()
-    resp = requests.post(
-        OPENIMIS_GRAPHQL_URL,
-        json={"query": query, "variables": variables},
+    csrf_token = _http_session.cookies.get("csrftoken")
+    headers = {
         # django-graphql-jwt historically expects the "JWT" prefix rather
         # than "Bearer" — if you get auth errors despite a valid token,
         # try changing this to f"JWT {token}".
-        headers={"Authorization": f"Bearer {token}"},
+        "Authorization": f"Bearer {token}",
+    }
+    if csrf_token:
+        headers["X-CSRFToken"] = csrf_token
+        headers["Referer"] = OPENIMIS_GRAPHQL_URL
+    resp = _http_session.post(
+        OPENIMIS_GRAPHQL_URL,
+        json={"query": query, "variables": variables},
+        headers=headers,
         timeout=30,
     )
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        # Surface the response body (often a GraphQL "errors" list with the
+        # actual validation/auth message) instead of letting raise_for_status
+        # hide it behind a bare "400 Client Error".
+        try:
+            detail = resp.json()
+        except ValueError:
+            detail = resp.text
+        raise RuntimeError(f"openIMIS GraphQL request failed ({resp.status_code}): {detail}")
     data = resp.json()
     if "errors" in data:
         raise RuntimeError(f"openIMIS GraphQL error: {data['errors']}")
@@ -233,7 +288,9 @@ def _introspect_input_type(type_name: str) -> Optional[list[dict]]:
 def search_insuree(chf_id: Optional[str] = None, last_name: Optional[str] = None) -> list[dict]:
     """
     Search for an insuree (insured person) by CHF ID (exact) or last name (partial).
-    Returns basic identifying info only — not full medical/claim history.
+    Returns basic identifying info plus the internal numeric insuree_id —
+    that numeric ID (not the CHF ID) is what create_claim's "insuree" field
+    expects.
 
     Args:
         chf_id: Exact CHF/insuree identification number.
@@ -243,16 +300,16 @@ def search_insuree(chf_id: Optional[str] = None, last_name: Optional[str] = None
 
     if chf_id:
         sql = '''
-            SELECT "CHFID" AS chf_id, "LastName" AS last_name, "OtherNames" AS other_names,
-                   "DOB" AS date_of_birth, "Gender" AS gender
+            SELECT "InsureeID" AS insuree_id, "CHFID" AS chf_id, "LastName" AS last_name,
+                   "OtherNames" AS other_names, "DOB" AS date_of_birth, "Gender" AS gender
             FROM "tblInsuree"
             WHERE "CHFID" = %s AND "ValidityTo" IS NULL
         '''
         return run_query(sql, (chf_id,))
     elif last_name:
         sql = '''
-            SELECT "CHFID" AS chf_id, "LastName" AS last_name, "OtherNames" AS other_names,
-                   "DOB" AS date_of_birth, "Gender" AS gender
+            SELECT "InsureeID" AS insuree_id, "CHFID" AS chf_id, "LastName" AS last_name,
+                   "OtherNames" AS other_names, "DOB" AS date_of_birth, "Gender" AS gender
             FROM "tblInsuree"
             WHERE "LastName" ILIKE %s AND "ValidityTo" IS NULL
             ORDER BY "LastName"
@@ -343,7 +400,10 @@ def get_claim_by_code(claim_code: str) -> list[dict]:
 @mcp.tool()
 def list_health_facilities(district: Optional[str] = None) -> list[dict]:
     """
-    List health facilities, optionally filtered by district name.
+    List health facilities, optionally filtered by district name. Returns
+    the facility code/name plus the internal numeric hf_id — that numeric
+    ID (not the facility code) is what create_claim's "healthFacility"
+    field expects.
 
     Args:
         district: Optional partial, case-insensitive district name filter.
@@ -351,8 +411,8 @@ def list_health_facilities(district: Optional[str] = None) -> list[dict]:
     log_call("list_health_facilities", district=district)
     if district:
         sql = '''
-            SELECT hf."HFCode" AS code, hf."HFName" AS name, hf."HFLevel" AS level,
-                   loc."LocationName" AS district
+            SELECT hf."HfID" AS hf_id, hf."HFCode" AS code, hf."HFName" AS name,
+                   hf."HFLevel" AS level, loc."LocationName" AS district
             FROM "tblHF" hf
             JOIN "tblLocations" loc ON loc."LocationId" = hf."LocationId"
             WHERE loc."LocationName" ILIKE %s AND hf."ValidityTo" IS NULL
@@ -361,7 +421,8 @@ def list_health_facilities(district: Optional[str] = None) -> list[dict]:
         return run_query(sql, (f"%{district}%",))
     else:
         sql = '''
-            SELECT hf."HFCode" AS code, hf."HFName" AS name, hf."HFLevel" AS level
+            SELECT hf."HfID" AS hf_id, hf."HFCode" AS code, hf."HFName" AS name,
+                   hf."HFLevel" AS level
             FROM "tblHF" hf
             WHERE hf."ValidityTo" IS NULL
             ORDER BY hf."HFName"
@@ -400,7 +461,7 @@ def search_medical_service(query: str) -> list[dict]:
     by code or partial name match. Use this to resolve a valid service
     ID/code before calling create_claim.
 
-    NOTE: table/column names here ("tblMedicalServices") are a best guess
+    NOTE: table/column names here ("tblServices") are a best guess
     and NOT verified against a live openIMIS instance — confirm with
     \\dt / \\d in psql and adjust if needed.
 
@@ -411,7 +472,7 @@ def search_medical_service(query: str) -> list[dict]:
     sql = '''
         SELECT "ServiceID" AS service_id, "ServCode" AS code, "ServName" AS name,
                "ServPrice" AS price
-        FROM "tblMedicalServices"
+        FROM "tblServices"
         WHERE ("ServCode" ILIKE %s OR "ServName" ILIKE %s) AND "ValidityTo" IS NULL
         ORDER BY "ServName"
     '''
@@ -426,7 +487,7 @@ def search_medical_item(query: str) -> list[dict]:
     partial name match. Use this to resolve a valid item ID/code before
     calling create_claim.
 
-    NOTE: table/column names here ("tblMedicalItems") are a best guess and
+    NOTE: table/column names here ("tblItems") are a best guess and
     NOT verified against a live openIMIS instance — confirm with \\dt / \\d
     in psql and adjust if needed.
 
@@ -437,7 +498,7 @@ def search_medical_item(query: str) -> list[dict]:
     sql = '''
         SELECT "ItemID" AS item_id, "ItemCode" AS code, "ItemName" AS name,
                "ItemPrice" AS price
-        FROM "tblMedicalItems"
+        FROM "tblItems"
         WHERE ("ItemCode" ILIKE %s OR "ItemName" ILIKE %s) AND "ValidityTo" IS NULL
         ORDER BY "ItemName"
     '''
@@ -690,6 +751,203 @@ def detect_diagnosis_anomalies(
     return run_query(sql, params, max_rows=top_n)
 
 
+@mcp.tool()
+def get_reimbursement_delay_by_facility(
+    lookback_days: int = 180,
+    min_claims: int = 5,
+    top_n: int = 20,
+) -> list[dict]:
+    """
+    Find health facilities (providers) with the longest delay between
+    submitting a claim and it being processed/adjudicated — a proxy for
+    "slow to be reimbursed". Returns facilities sorted by average delay,
+    longest first.
+
+    IMPORTANT CAVEAT: this measures days from DateClaimed (submission) to
+    DateProcessed (adjudication/decision), NOT necessarily the date money
+    actually left the bank account. If your openIMIS instance tracks a
+    separate payment/disbursement date (e.g. through a batch payment
+    module) rather than treating DateProcessed as the final step, that
+    field would be the more accurate one to use here — check with
+    `\\d "tblClaim"` for something like DatePaid, or a related payment
+    table, before treating this as literal payment delay.
+
+    Only claims that have actually been processed are included (claims
+    still pending aren't counted as "delayed" — they're just not done yet).
+
+    Args:
+        lookback_days: How far back to look, based on claim submission
+            date. Default 180 (roughly 6 months).
+        min_claims: Minimum number of processed claims a facility needs to
+            be included — filters out noise from very low-volume
+            facilities where one slow claim skews the average heavily.
+        top_n: Max number of facilities to return (capped at 50).
+    """
+    top_n = min(max(top_n, 1), 50)
+    start_date = date.today() - timedelta(days=lookback_days)
+
+    log_call(
+        "get_reimbursement_delay_by_facility",
+        lookback_days=lookback_days, min_claims=min_claims, top_n=top_n,
+    )
+
+    sql = '''
+        SELECT hf."HFCode" AS code, hf."HFName" AS name,
+               COUNT(*) AS processed_claims,
+               ROUND(AVG(c."DateProcessed"::date - c."DateClaimed"::date)::numeric, 1) AS avg_delay_days,
+               ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (
+                   ORDER BY (c."DateProcessed"::date - c."DateClaimed"::date)
+               )::numeric, 1) AS median_delay_days,
+               MAX(c."DateProcessed"::date - c."DateClaimed"::date) AS max_delay_days
+        FROM "tblClaim" c
+        JOIN "tblHF" hf ON hf."HfID" = c."HFID"
+        WHERE c."ValidityTo" IS NULL
+          AND c."DateProcessed" IS NOT NULL
+          AND c."DateClaimed" >= %(start_date)s
+        GROUP BY hf."HFCode", hf."HFName"
+        HAVING COUNT(*) >= %(min_claims)s
+        ORDER BY avg_delay_days DESC
+        LIMIT %(top_n)s
+    '''
+    params = {"start_date": start_date, "min_claims": min_claims, "top_n": top_n}
+    return run_query(sql, params, max_rows=top_n)
+
+
+@mcp.tool()
+def detect_item_supply_risk(
+    baseline_days: int = 90,
+    recent_days: int = 14,
+    min_total_dispensed: int = 5,
+    z_threshold: float = -2.0,
+    top_n: int = 20,
+) -> list[dict]:
+    """
+    Screen for possible drug/item shortages by flagging facility-item pairs
+    where recent dispensing volume has dropped statistically far below
+    their own historical baseline — the mirror image of
+    detect_diagnosis_anomalies (there, spikes are the signal being
+    screened for; here, drops are).
+
+    IMPORTANT — this is a weaker, noisier signal than the outbreak-detection
+    tool, and should be treated with real caution:
+    - Claims data reflects what was DISPENSED AND BILLED, not what's
+      currently in stock. A drop can mean a real shortage, but can just as
+      easily mean falling demand, a provider substituting a different
+      item, a coding change, or a facility temporarily closed — none of
+      which are shortages.
+    - If your openIMIS deployment has an actual stock/inventory module
+      (some do — check for tables with "stock" in the name via \\dt), USE
+      THAT INSTEAD for a direct answer (stock on hand vs. reorder
+      threshold) rather than this indirect claims-based proxy.
+    - Treat any result here as "worth someone calling the facility to ask
+      whether they're running low", never as a confirmed shortage.
+
+    NOTE: "tblClaimItems" and its column names are a best guess (not
+    verified against a live instance) — confirm with \\d "tblClaimItems"
+    and adjust if your schema differs.
+
+    Args:
+        baseline_days: Days of history for the baseline, ending right
+            before the recent window. Default 90.
+        recent_days: Length of the recent window being screened. Default 14
+            — shorter than detect_diagnosis_anomalies's default, since
+            shortages can develop faster than disease trends.
+        min_total_dispensed: Minimum combined dispense count (baseline +
+            recent) for an item/facility pair to be included — filters out
+            noise from rarely-used items.
+        z_threshold: Flag pairs at or below this z-score (negative = below
+            baseline). Default -2.0.
+        top_n: Max rows to return, most negative z-score first (capped at 50).
+    """
+    top_n = min(max(top_n, 1), 50)
+    today = date.today()
+    recent_start = today - timedelta(days=recent_days)
+    baseline_start = today - timedelta(days=baseline_days + recent_days)
+
+    log_call(
+        "detect_item_supply_risk",
+        baseline_days=baseline_days, recent_days=recent_days,
+        min_total_dispensed=min_total_dispensed, z_threshold=z_threshold, top_n=top_n,
+    )
+
+    sql = '''
+        WITH observed AS (
+            SELECT ci."ItemID" AS item_id, hf."HfID" AS hf_id,
+                   mi."ItemName" AS item_name, hf."HFCode" AS hf_code, hf."HFName" AS hf_name
+            FROM "tblClaimItems" ci
+            JOIN "tblClaim" c ON c."ClaimID" = ci."ClaimID"
+            JOIN "tblHF" hf ON hf."HfID" = c."HFID"
+            JOIN "tblItems" mi ON mi."ItemID" = ci."ItemID"
+            WHERE ci."ValidityTo" IS NULL AND c."ValidityTo" IS NULL
+              AND c."DateClaimed" >= %(baseline_start)s
+            GROUP BY 1, 2, 3, 4, 5
+            HAVING COUNT(*) >= %(min_total_dispensed)s
+        ),
+        date_series AS (
+            SELECT generate_series(%(baseline_start)s::date, %(today)s::date - INTERVAL '1 day', '1 day')::date AS claim_date
+        ),
+        grid AS (
+            SELECT ds.claim_date, o.item_id, o.hf_id, o.item_name, o.hf_code, o.hf_name
+            FROM date_series ds
+            CROSS JOIN observed o
+        ),
+        actual_counts AS (
+            SELECT c."DateClaimed"::date AS claim_date, ci."ItemID" AS item_id, hf."HfID" AS hf_id,
+                   COUNT(*) AS cnt
+            FROM "tblClaimItems" ci
+            JOIN "tblClaim" c ON c."ClaimID" = ci."ClaimID"
+            JOIN "tblHF" hf ON hf."HfID" = c."HFID"
+            WHERE ci."ValidityTo" IS NULL AND c."ValidityTo" IS NULL
+              AND c."DateClaimed" >= %(baseline_start)s
+            GROUP BY 1, 2, 3
+        ),
+        daily AS (
+            SELECT g.claim_date, g.item_id, g.hf_id, g.item_name, g.hf_code, g.hf_name,
+                   COALESCE(a.cnt, 0) AS cnt
+            FROM grid g
+            LEFT JOIN actual_counts a
+              ON a.claim_date = g.claim_date AND a.item_id = g.item_id AND a.hf_id = g.hf_id
+        ),
+        baseline AS (
+            SELECT item_id, hf_id, AVG(cnt) AS baseline_avg, STDDEV(cnt) AS baseline_stddev
+            FROM daily
+            WHERE claim_date < %(recent_start)s
+            GROUP BY item_id, hf_id
+        ),
+        recent AS (
+            SELECT item_id, hf_id, item_name, hf_code, hf_name,
+                   AVG(cnt) AS recent_avg, SUM(cnt) AS recent_total
+            FROM daily
+            WHERE claim_date >= %(recent_start)s
+            GROUP BY item_id, hf_id, item_name, hf_code, hf_name
+        )
+        SELECT r.hf_code AS facility_code, r.hf_name AS facility_name,
+               r.item_name,
+               r.recent_total AS recent_dispensed,
+               ROUND(r.recent_avg::numeric, 2) AS recent_avg_per_day,
+               ROUND(b.baseline_avg::numeric, 2) AS baseline_avg_per_day,
+               ROUND(b.baseline_stddev::numeric, 2) AS baseline_stddev,
+               CASE WHEN COALESCE(b.baseline_stddev, 0) = 0 THEN NULL
+                    ELSE ROUND(((r.recent_avg - b.baseline_avg) / b.baseline_stddev)::numeric, 2)
+               END AS z_score
+        FROM recent r
+        JOIN baseline b USING (item_id, hf_id)
+        WHERE b.baseline_avg > 0  -- only flag items that WERE being used regularly before
+          AND COALESCE(((r.recent_avg - b.baseline_avg) / NULLIF(b.baseline_stddev, 0)), 0) <= %(z_threshold)s
+        ORDER BY z_score ASC NULLS LAST
+        LIMIT %(top_n)s
+    '''
+    params = {
+        "baseline_start": baseline_start,
+        "recent_start": recent_start,
+        "today": today,
+        "min_total_dispensed": min_total_dispensed,
+        "z_threshold": z_threshold,
+        "top_n": top_n,
+    }
+    return run_query(sql, params, max_rows=top_n)
+
+
 # ---------------------------------------------------------------------------
 # Write tools (openIMIS GraphQL API — claim creation)
 # ---------------------------------------------------------------------------
@@ -746,6 +1004,30 @@ def get_claim_mutation_schema() -> dict:
 
 
 @mcp.tool()
+def introspect_input_type(type_name: str) -> list[dict]:
+    """
+    Introspect any named GraphQL input type on openIMIS's own schema and
+    return its field names/types. get_claim_mutation_schema only expands the
+    top-level input type for createClaim/updateClaim/submitClaim — use this
+    to look inside nested input types it references (e.g. ClaimItemInputType,
+    ClaimServiceInputType, ClaimAttachmentInputType) before building
+    claim_input for create_claim, rather than guessing field names.
+
+    Args:
+        type_name: Exact GraphQL input type name, e.g. "ClaimItemInputType"
+            (as seen in a "type" value returned by get_claim_mutation_schema).
+    """
+    log_call("introspect_input_type", type_name=type_name)
+    fields = _introspect_input_type(type_name)
+    if fields is None:
+        return []
+    return [
+        {"name": fld["name"], "type": _unwrap_gql_type(fld["type"])}
+        for fld in fields
+    ]
+
+
+@mcp.tool()
 def create_claim(claim_input: dict) -> dict:
     """
     Create a claim in openIMIS via its own GraphQL createClaim mutation —
@@ -773,17 +1055,18 @@ def create_claim(claim_input: dict) -> dict:
     """
     log_call("create_claim")
     mutation = '''
-        mutation CreateClaim($input: ClaimInputType!) {
+        mutation CreateClaim($input: CreateClaimMutationInput!) {
             createClaim(input: $input) {
                 clientMutationId
                 internalId
             }
         }
     '''
-    # NOTE: "ClaimInputType" is a common name for this input type across
-    # openIMIS versions, but confirm the exact name via
-    # get_claim_mutation_schema() and adjust this string if your instance
-    # names it differently.
+    # NOTE: confirmed via get_claim_mutation_schema() introspection that this
+    # instance's input type is "CreateClaimMutationInput" (not the more
+    # commonly-named "ClaimInputType" seen in some openIMIS deployments) —
+    # re-check with get_claim_mutation_schema() if you point this at a
+    # different instance.
     return _openimis_graphql(mutation, {"input": claim_input})
 
 

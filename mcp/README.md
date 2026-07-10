@@ -18,6 +18,15 @@ for querying an openIMIS PostgreSQL database:
   screens for possible outbreak signals: diagnosis categories per district
   running statistically above their historical baseline (see "Detecting
   outbreak signals" below — **screening signal, not a diagnosis of an outbreak**)
+- `get_reimbursement_delay_by_facility(lookback_days, min_claims, top_n)` —
+  providers with the longest submission-to-processing delay (see caveat in
+  the tool's own docstring: this measures processing delay, not necessarily
+  actual payment date — check your schema for a payment/disbursement field)
+- `detect_item_supply_risk(baseline_days, recent_days, min_total_dispensed, z_threshold, top_n)` —
+  screens for possible drug/item shortages: facility-item pairs where
+  dispensing volume has dropped statistically far below their own baseline
+  (see "Detecting supply risk" below — **weak, noisy signal; check for a
+  real stock/inventory module first**)
 - `get_claim_mutation_schema()`, `create_claim(claim_input)`, `submit_claim(claim_uuid)` —
   create claims via openIMIS's own GraphQL API (see "Creating claims" below)
 
@@ -487,6 +496,33 @@ a historical baseline, not just a raw count comparison.
   `baseline_days` values on a large, diverse dataset can get slow. The
   `min_total_claims` filter exists specifically to keep that cross-join
   small by dropping categories too rare to bother analyzing anyway.
+
+## Detecting supply risk
+
+`detect_item_supply_risk` flags facility-item pairs where recent dispensing
+volume has dropped statistically far below their own historical baseline —
+the same z-score idea as `detect_diagnosis_anomalies`, but looking for
+drops instead of spikes.
+
+**Read this before treating any result as meaningful — more so than the
+outbreak-detection tool:**
+
+- **This is a weaker, noisier signal than outbreak detection.** A drop in
+  claims/dispensing for an item can mean a real shortage, but can just as
+  easily mean falling genuine demand, a provider substituting a different
+  item, a coding change, or a facility temporarily closed. None of those
+  are shortages, and claims data has no way to tell them apart from a real
+  stockout.
+- **Check for a real stock/inventory data source first.** If your openIMIS
+  deployment (or a connected system) tracks actual stock-on-hand and
+  reorder thresholds, that answers "is there a shortage risk" directly and
+  far more reliably than this proxy. Look for tables with "stock" in the
+  name (`\dt` again) before leaning on this tool.
+- **Treat a flagged result as "worth calling the facility to ask", never
+  as a confirmed shortage.**
+- Same unverified-schema caveat as the other item-related tools:
+  `tblClaimItems` and its column names haven't been checked against a live
+  instance — confirm with `\d "tblClaimItems"`.
 
 ## Testing
 
