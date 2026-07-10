@@ -6,8 +6,8 @@ from mcp_client import MultiMcpManager
 
 load_dotenv()
 
-st.set_page_config(page_title="Clinical Compliance Assistant", layout="wide")
-st.title("🏥 Clinical & Compliance AI Assistant")
+st.set_page_config(page_title="Health Help Agent", layout="wide")
+st.title("🏥 Health Help Agent")
 
 # System instruction matching the defined operational rules
 SYSTEM_INSTRUCTION = """
@@ -54,25 +54,29 @@ for server, info in status.items():
     if not info["connected"]:
         st.warning(f"⚠️ Could not connect to {server.upper()} MCP server: {info['error']}")
 
-if "gemini_client" not in st.session_state:
-    st.session_state.gemini_client = genai.Client()
+try:
+    if "gemini_client" not in st.session_state:
+        st.session_state.gemini_client = genai.Client()
 
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
 
-if "gemini_chat_session" not in st.session_state:
-    # Gather dynamic tools from active MCP endpoints
-    mcp_tools = st.session_state.mcp_manager.get_all_tools()
-    
-    # Initialize the Gemini Chat session
-    st.session_state.gemini_chat_session = st.session_state.gemini_client.chats.create(
-        model="gemini-2.5-flash",
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_INSTRUCTION,
-            tools=mcp_tools if mcp_tools else None,
-            temperature=0.1
+    if "gemini_chat_session" not in st.session_state:
+        # Gather dynamic tools from active MCP endpoints
+        mcp_tools = st.session_state.mcp_manager.get_all_tools()
+        
+        # Initialize the Gemini Chat session
+        st.session_state.gemini_chat_session = st.session_state.gemini_client.chats.create(
+            model="gemini-2.5-flash",
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_INSTRUCTION,
+                tools=mcp_tools if mcp_tools else None,
+                temperature=0.1
+            )
         )
-    )
+except Exception as e:
+    st.error(f"❌ Failed to initialize Gemini Client: {e}")
+    st.stop()
 
 # Display historical messages in the chat UI
 for message in st.session_state.chat_history:

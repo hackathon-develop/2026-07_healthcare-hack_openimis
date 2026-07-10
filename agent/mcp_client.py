@@ -43,21 +43,7 @@ class MultiMcpManager:
         """Establishes SSE connections to both MCP servers."""
         # Connect to EMR MCP
         try:
-            headers = {}
-            auth_env = os.getenv("EMR_MCP_AUTH")
-            if auth_env:
-                auth_env = auth_env.strip()
-                if ":" in auth_env:
-                    username, password = auth_env.split(":", 1)
-                    encoded = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("utf-8")
-                    headers["Authorization"] = f"Basic {encoded}"
-                else:
-                    if not auth_env.lower().startswith("basic "):
-                        headers["Authorization"] = f"Basic {auth_env}"
-                    else:
-                        headers["Authorization"] = auth_env
-
-            emr_ctx = sse_client(url=self.emr_url, headers=headers if headers else None)
+            emr_ctx = sse_client(url=self.emr_url)
             self._contexts.append(emr_ctx)
             emr_read, emr_write = await emr_ctx.__aenter__()
             emr_session = ClientSession(emr_read, emr_write)
