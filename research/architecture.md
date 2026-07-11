@@ -499,10 +499,10 @@ Ensure you are in the directory containing your `Dockerfile` and run:
 ```powershell
 # Define a variable for your app name
 $APP_NAME = "agent"
+$PROJECT_ID = "hh-berlin26ber-500"
 
 # Submit the build to Google Cloud Build
-gcloud builds submit --tag gcr.io/YOUR_PROJECT_ID/$APP_NAME
-
+gcloud builds submit --tag gcr.io/$PROJECT_ID/$APP_NAME
 ```
 
 *(Wait for this process to complete. It will output a SUCCESS message when the image is stored).*
@@ -517,7 +517,7 @@ Execute this single command (adjust the URLs and API key to match your real valu
 
 ```powershell
 gcloud run deploy $APP_NAME `
-  --image gcr.io/YOUR_PROJECT_ID/$APP_NAME `
+  --image gcr.io/$PROJECT_ID/$APP_NAME `
   --region europe-west1 `
   --platform managed `
   --allow-unauthenticated `

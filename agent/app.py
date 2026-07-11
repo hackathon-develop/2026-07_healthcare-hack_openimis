@@ -47,7 +47,9 @@ def log_debug(message):
 
 # ----------------- UI Layout -----------------
 if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+    st.session_state.chat_history = [
+        {"role": "assistant", "content": "Hello! I am the Health Help Agent. Please provide the Patient ID you would like me to check."}
+    ]
 
 if show_debug:
     main_col, debug_col = st.columns([3, 1])
@@ -79,6 +81,7 @@ if user_input := st.chat_input("Enter your message here..."):
                 if "mcp_manager" not in st.session_state:
                     log_debug("Initializing MCP Manager...")
                     manager = MultiMcpManager()
+                    log_debug(f"Starting to connect to EMR MCP ({manager.emr_url}) and openISMS MCP ({manager.isms_url})...")
                     manager.connect()
                     st.session_state.mcp_manager = manager
                     log_debug("MCP Manager connected.")
@@ -150,17 +153,10 @@ if user_input := st.chat_input("Enter your message here..."):
 
 if debug_col:
     with debug_col:
-        st.subheader("🛠️ Debug Logs")
-        try:
-            debug_container = st.container(height=600)
-            with debug_container:
-                for log_msg in st.session_state.debug_logs:
-                    st.text(log_msg)
-        except TypeError:
-            # Fallback for older Streamlit versions that don't support height in st.container
+        with st.expander("🛠️ Debug Logs", expanded=True):
             for log_msg in st.session_state.debug_logs:
                 st.text(log_msg)
                 
-        if st.button("Clear Logs"):
-            st.session_state.debug_logs = []
-            st.rerun()
+            if st.button("Clear Logs"):
+                st.session_state.debug_logs = []
+                st.rerun()
